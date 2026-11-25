@@ -1,0 +1,88 @@
+name: CI Pipeline - Build y Pruebas Automatizadas
+
+# Disparadores: se ejecuta automaticamente ante cada push o PR en ramas GitFlow
+on:
+  push:
+    branches: [main, develop, "feature/**", "release/**"]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # =========================================================================
+  # STAGE 1: CHECKOUT & BUILD (Estrategia Fail-Fast)
+  # Compila codigo fuente y pruebas antes de invertir tiempo en ejecuciones
+  # =========================================================================
+  build:
+    name: 1. Checkout & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17 con cache de dependencias Maven
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: Compilar codigo fuente y clases de prueba
+        run: mvn clean test-compile
+
+  # =========================================================================
+  # STAGE 2: PRUEBAS UNITARIAS (JUnit 5 + Maven Surefire)
+  # Valida la logica de negocio aislada y publica reportes XML
+  # =========================================================================
+  unit-tests:
+    name: 2. Pruebas Unitarias (Surefire)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17 con cache de dependencias Maven
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: Ejecutar suite de pruebas unitarias
+        run: mvn test
+
+      - name: Publicar reporte de pruebas unitarias (Surefire)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-unit-reports
+          path: target/surefire-reports/
+
+  # =========================================================================
+  # STAGE 3: PRUEBAS DE INTEGRACION (HTTP REST + Maven Failsafe)
+  # Levanta el servidor embebido y valida contratos de API de extremo a extremo
+  # =========================================================================
+  integration-tests:
+    name: 3. Pruebas de Integracion (Failsafe)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17 con cache de dependencias Maven
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: Ejecutar suite de pruebas de integracion
+        run: mvn verify -Dsurefire.skip=true
+
+      - name: Publicar reporte de pruebas de integracion (Failsafe)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failsafe-integration-reports
+          path: target/failsafe-reports/
