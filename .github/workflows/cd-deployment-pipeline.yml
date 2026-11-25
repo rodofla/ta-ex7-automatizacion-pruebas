@@ -1,0 +1,123 @@
+name: CD Deployment Pipeline - Acceptance Gate, Blue-Green y Rollback
+
+on:
+  push:
+    branches: [main, "release/**"]
+  workflow_dispatch:
+    inputs:
+      simular_fallo_post_deploy:
+        description: "Simular error critico tras el switch Blue-Green para ejecutar Rollback automatico"
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  deployment-pipeline:
+    name: Deployment Pipeline (Staging -> Acceptance Gate -> Blue-Green -> Rollback)
+    runs-on: ubuntu-latest
+
+    steps:
+      # =====================================================================
+      # STAGE 1: CHECKOUT, BUILD & EMPAQUETADO DE ARTEFACTO
+      # =====================================================================
+      - name: Stage 1 - Checkout y Empaquetado Maven + Docker
+        run: |
+          echo "=== STAGE 1: BUILD & PACKAGE ==="
+      - uses: actions/checkout@v4
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: Empaquetar JAR y construir imagen Docker
+        run: |
+          mvn clean package -DskipTests
+          docker build -t gestor-tareas:latest .
+
+      # =====================================================================
+      # STAGE 2: DESPLIEGUE EN AMBIENTE DE PRUEBAS (STAGING)
+      # =====================================================================
+      - name: Stage 2 - Despliegue en Ambiente de Pruebas (Staging)
+        run: |
+          echo "=== STAGE 2: DEPLOY TO STAGING ==="
+          docker run -d --name staging-env -p 8090:8080 \
+            -e PORT=8080 -e APP_VERSION="2.0.0-STAGING" gestor-tareas:latest
+          sleep 2
+          curl -sf http://localhost:8090/health
+
+      # =====================================================================
+      # STAGE 3: AUTOMATED ACCEPTANCE TEST GATE (CUCUMBER BDD)
+      # Bloquea el avance a produccion si fallan los criterios de negocio
+      # =====================================================================
+      - name: Stage 3 - Automated Acceptance Test Gate (Cucumber BDD)
+        env:
+          STAGING_URL: http://localhost:8090
+        run: |
+          echo "=== STAGE 3: ACCEPTANCE GATE (CUCUMBER BDD) ==="
+          mvn test -Dtest=RunAcceptanceTest
+          docker stop staging-env && docker rm staging-env
+
+      - name: Publicar Reporte HTML de Aceptacion (BDD)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cucumber-acceptance-report
+          path: target/acceptance-report.html
+
+      # =====================================================================
+      # STAGE 4: DESPLIEGUE BLUE-GREEN (SWITCH ZERO-DOWNTIME)
+      # =====================================================================
+      - name: Stage 4 - Despliegue Blue-Green (Blue v1.0.0 -> Green v2.0.0)
+        run: |
+          echo "=== STAGE 4: BLUE-GREEN DEPLOYMENT ==="
+          ./infra/deploy-blue-green.sh
+
+      # =====================================================================
+      # STAGE 5: VALIDACION POST-DESPLIEGUE Y DETECCION DE ANOMALIAS
+      # =====================================================================
+      - name: Stage 5 - Monitoreo Post-Despliegue
+        run: |
+          echo "=== STAGE 5: VERIFICACION POST-DESPLIEGUE ==="
+          if [ "${{ github.event.inputs.simular_fallo_post_deploy }}" == "true" ]; then
+            echo "[ERROR SIMULADO] Latencia critica y errores HTTP 500 detectados en GREEN!"
+            exit 1
+          fi
+          curl -sf http://localhost:8080/health | grep '"version":"2.0.0-GREEN"'
+          echo "[OK] Entorno GREEN operando establemente en produccion."
+
+      # =====================================================================
+      # STAGE 6: MECANISMO DE RECUPERACION - ROLLBACK AUTOMATICO
+      # Se dispara automaticamente ante cualquier fallo en el despliegue
+      # =====================================================================
+      - name: Stage 6 - Rollback Automatico a Version Estable (BLUE)
+        if: failure()
+        run: |
+          echo "=== STAGE 6: EJECUTANDO ROLLBACK AUTOMATICO ==="
+          ./infra/rollback.sh
+
+      # =====================================================================
+      # STAGE 7: AUDITORIA Y LIMPIEZA DE CONTENEDORES
+      # =====================================================================
+      - name: Stage 7 - Registro de Auditoria y Limpieza
+        if: always()
+        run: |
+          cat << EOF > deploy-metadata.json
+          {
+            "pipeline": "${{ github.workflow }}",
+            "run_id": "${{ github.run_id }}",
+            "commit_sha": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "rollback_triggered": "${{ github.event.inputs.simular_fallo_post_deploy || 'false' }}"
+          }
+          EOF
+          cat deploy-metadata.json
+          docker rm -f app-blue app-green lb-router staging-env 2>/dev/null || true
+
+      - name: Archivar Evidencia de Auditoria de Despliegue
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-audit-metadata
+          path: deploy-metadata.json
